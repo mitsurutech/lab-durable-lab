@@ -1,0 +1,482 @@
+# Durable execution from first principles: a workflow engine small enough to read, a journal
+# in PostgreSQL, and workflows you can crash on purpose and resume.
+#
+# Your copy is the only thing in this lab, and it has no way out to the internet: nothing is
+# downloaded when it starts and nothing you run can reach anybody else's machine.
+#
+# Two services. db is PostgreSQL 16, holding the journal and the tables the workflows write
+# to. worker is Python 3.12 with the lab's files in /tmp: pg.py (a very small PostgreSQL
+# client written for this lab, so nothing has to be installed), engine.py (the engine: a step
+# runs once, its result goes in the journal, and a rerun replays it), shop.py (the outside
+# world: stock, a card provider, email, a courier and bookings, each writing a row), and five
+# workflows to run, crash and resume: naive.py, order.py, retry.py, remind.py and saga.py.
+# The terminal beside the lab reaches them with docker exec, for example
+#   docker exec worker python3 order.py order-7 --fresh --crash-after 2
+#   docker exec worker python3 order.py order-7
+#   docker exec db psql -U durable -c "SELECT workflow, seq, step FROM journal"
+# Every Run prints the same every time: nothing depends on the clock or on chance.
+#
+# Hand in a workflow of your own, written with engine.py (for example a sign-up that creates
+# an account, sends a welcome email and books a call), the output of a run you crashed with
+# --crash-after, the output of the run that resumed it, and the journal rows from psql, with
+# a sentence on which steps ran twice and which did not. Write it with
+#   docker exec -i worker sh -c "cat > /tmp/signup.py"
+# and download nothing: copy the output from the terminal.
+#
+# The worker runs as an unprivileged account. The database asks for no password because
+# nothing outside this lab can reach it; never run PostgreSQL like this anywhere else.
+# Nothing is saved: stopping the lab forgets the journal and every file you wrote.
+
+services:
+  db:
+    image: postgres:16.15-alpine
+    environment:
+      POSTGRES_USER: durable
+      POSTGRES_DB: durable
+      POSTGRES_HOST_AUTH_METHOD: trust
+    expose: ["5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U durable -d durable"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    labels:
+      lab.title: PostgreSQL, the journal
+
+  worker:
+    image: python:3.12.15-alpine
+    user: "65532:65532"
+    working_dir: /tmp
+    environment:
+      HOME: /tmp
+      PYTHONPATH: /tmp
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+    depends_on:
+      db:
+        condition: service_healthy
+    entrypoint:
+      - sh
+      - -c
+      - |
+        cd /tmp
+        cat > pg.py <<'PY'
+        """A very small PostgreSQL client, written for this lab so that nothing has to be installed.
+
+        It speaks PostgreSQL's own wire protocol over a socket. Call run(sql, value, ...) with %s
+        where each value goes, as the psycopg library does: the values travel separately from the
+        SQL, so they are never pasted into it. Each call is its own transaction."""
+        import socket
+        import struct
+
+        PLACEHOLDER = chr(36)
+
+
+        class PgError(Exception):
+            pass
+
+
+        class Connection:
+            def __init__(self, host="db", user="durable", database="durable", port=5432):
+                self.sock = socket.create_connection((host, port), timeout=10)
+                body = struct.pack("!i", 196608)
+                body += b"user\0" + user.encode() + b"\0database\0" + database.encode() + b"\0\0"
+                self.sock.sendall(struct.pack("!i", len(body) + 4) + body)
+                self._answer()
+
+            def _read(self, size):
+                data = b""
+                while len(data) < size:
+                    chunk = self.sock.recv(size - len(data))
+                    if not chunk:
+                        raise PgError("the database closed the connection")
+                    data += chunk
+                return data
+
+            def _send(self, kind, body):
+                self.sock.sendall(kind + struct.pack("!i", len(body) + 4) + body)
+
+            def _answer(self):
+                rows = []
+                error = None
+                while True:
+                    kind = self._read(1)
+                    body = self._read(struct.unpack("!i", self._read(4))[0] - 4)
+                    if kind == b"R" and struct.unpack("!i", body[:4])[0] != 0:
+                        raise PgError("this lab's database expects no password")
+                    if kind == b"D":
+                        row = []
+                        at = 2
+                        for _ in range(struct.unpack("!h", body[:2])[0]):
+                            size = struct.unpack("!i", body[at:at + 4])[0]
+                            at += 4
+                            if size < 0:
+                                row.append(None)
+                            else:
+                                row.append(body[at:at + size].decode())
+                                at += size
+                        rows.append(row)
+                    elif kind == b"E":
+                        for field in body.split(b"\0"):
+                            if field[:1] == b"M":
+                                error = field[1:].decode()
+                    elif kind == b"Z":
+                        if error:
+                            raise PgError(error)
+                        return rows
+
+            def run(self, sql, *values):
+                parts = sql.split("%s")
+                if len(parts) - 1 != len(values):
+                    raise PgError("the SQL has a different number of %s from the values given")
+                text = parts[0]
+                for n in range(1, len(parts)):
+                    text += PLACEHOLDER + str(n) + parts[n]
+                self._send(b"P", b"\0" + text.encode() + b"\0" + struct.pack("!h", 0))
+                bind = b"\0\0" + struct.pack("!hh", 0, len(values))
+                for value in values:
+                    if value is None:
+                        bind += struct.pack("!i", -1)
+                    else:
+                        data = str(value).encode()
+                        bind += struct.pack("!i", len(data)) + data
+                self._send(b"B", bind + struct.pack("!h", 0))
+                self._send(b"D", b"P\0")
+                self._send(b"E", b"\0" + struct.pack("!i", 0))
+                self._send(b"S", b"")
+                return self._answer()
+        PY
+        cat > engine.py <<'PY'
+        """A durable execution engine small enough to read in one sitting.
+
+        A workflow is ordinary Python that calls wf.step(name, function, values...). Before a
+        step's result is used, the engine writes it to the journal table in PostgreSQL. If the
+        process dies, run the workflow again: every step already in the journal is replayed from
+        its row and not run again, and the work carries on from the first step with no row.
+        Real engines add many workers, queues, versioning and a web page around this idea."""
+        import json
+        import os
+
+        from pg import Connection
+
+        SCHEMA = (
+            "CREATE TABLE IF NOT EXISTS journal (workflow text, seq int, step text, result text,"
+            " PRIMARY KEY (workflow, seq))",
+            "CREATE TABLE IF NOT EXISTS payments (id serial PRIMARY KEY, workflow text,"
+            " idem_key text UNIQUE, amount int)",
+            "CREATE TABLE IF NOT EXISTS outbox (id serial PRIMARY KEY, workflow text, message text)",
+            "CREATE TABLE IF NOT EXISTS bookings (id serial PRIMARY KEY, workflow text, item text,"
+            " status text)",
+        )
+
+
+        class StepFailed(Exception):
+            """A step that cannot succeed, such as a car hire firm with no cars left."""
+
+
+        class NotDeterministic(Exception):
+            """The code asked for a different step from the one the journal holds at that place."""
+
+
+        def connect():
+            db = Connection()
+            for statement in SCHEMA:
+                db.run(statement)
+            return db
+
+
+        def forget(db, workflow):
+            """Start a workflow again from nothing: its journal rows and every row it wrote."""
+            for table in ("journal", "payments", "outbox", "bookings"):
+                db.run("DELETE FROM " + table + " WHERE workflow = %s", workflow)
+            print("forgot", workflow + ": no journal rows and nothing done")
+
+
+        def option(args, flag):
+            """The value after a flag on the command line, or None."""
+            if flag in args:
+                return args[args.index(flag) + 1]
+            return None
+
+
+        def crash(why):
+            print("*** crash on purpose " + why + ": the process stops here ***", flush=True)
+            os._exit(3)
+
+
+        class Workflow:
+            def __init__(self, db, name, crash_after=None, crash_inside=None):
+                self.db = db
+                self.name = name
+                self.seq = 0
+                self.new_steps = 0
+                self.crash_after = crash_after
+                self.crash_inside = crash_inside
+                self.journal = {}
+                rows = db.run("SELECT seq, step, result FROM journal WHERE workflow = %s"
+                              " ORDER BY seq", name)
+                for seq, step, result in rows:
+                    self.journal[int(seq)] = (step, result)
+                print("workflow", name + ", journal rows found:", len(self.journal))
+
+            def step(self, name, action, *values):
+                """Run a step once: replay it from the journal if its row is there, otherwise
+                run it and write its result down before going on."""
+                seq = self.seq
+                self.seq += 1
+                if seq in self.journal:
+                    recorded, result = self.journal[seq]
+                    if recorded != name:
+                        raise NotDeterministic("step " + str(seq) + ": the journal has " + recorded
+                                               + " but the code now asks for " + name)
+                    print("  replay  #" + str(seq), name, "->", result)
+                    return json.loads(result)
+                try:
+                    value = action(*values)
+                except StepFailed as failure:
+                    value = {"failed": str(failure)}
+                if self.crash_inside == name:
+                    crash("inside " + name + ", after its effect and before its journal row")
+                result = json.dumps(value, sort_keys=True)
+                self.db.run("INSERT INTO journal (workflow, seq, step, result)"
+                            " VALUES (%s, %s, %s, %s)", self.name, seq, name, result)
+                self.journal[seq] = (name, result)
+                print("  run     #" + str(seq), name, "->", result)
+                self.new_steps += 1
+                if self.crash_after == self.new_steps:
+                    crash("after " + str(self.new_steps) + " new steps")
+                return value
+
+            def sleep(self, name, seconds, now):
+                """A durable timer: the time to wake is a journal row, so a crash or a stop does
+                not start the wait again. Answers the seconds left, 0 once it is due."""
+                def wake_time():
+                    return {"wake_at": now + seconds}
+                wake = self.step(name, wake_time)["wake_at"]
+                return max(0, wake - now)
+        PY
+        cat > shop.py <<'PY'
+        """The outside world the workflows talk to: stock, a card provider, email, a courier and
+        bookings. Each effect writes a row, so psql can count what really happened."""
+        from engine import StepFailed
+
+
+        def reserve_stock(order):
+            return {"reserved": 2}
+
+
+        def charge_card(db, workflow, pence, key=None):
+            """Take a payment. With an idempotency key, the provider takes it once per key and
+            answers a repeat with the payment it already took."""
+            if key is None:
+                db.run("INSERT INTO payments (workflow, amount) VALUES (%s, %s)", workflow, pence)
+                return {"charged": pence}
+            rows = db.run("INSERT INTO payments (workflow, idem_key, amount) VALUES (%s, %s, %s)"
+                          " ON CONFLICT (idem_key) DO NOTHING RETURNING id", workflow, key, pence)
+            if rows:
+                return {"charged": pence, "key": key}
+            return {"charged": pence, "key": key, "repeat": True}
+
+
+        def send_message(db, workflow, message):
+            db.run("INSERT INTO outbox (workflow, message) VALUES (%s, %s)", workflow, message)
+            return {"emailed": message}
+
+
+        def book_courier(order):
+            return {"tracking": "TRK-" + order}
+
+
+        def book(db, trip, item, fail):
+            if fail:
+                raise StepFailed("no " + item + " left")
+            db.run("INSERT INTO bookings (workflow, item, status) VALUES (%s, %s, 'booked')",
+                   trip, item)
+            return {"booked": item}
+
+
+        def cancel(db, trip, item):
+            db.run("UPDATE bookings SET status = 'cancelled' WHERE workflow = %s AND item = %s",
+                   trip, item)
+            return {"cancelled": item}
+        PY
+        cat > naive.py <<'PY'
+        """The order job with no journal, the way many jobs are first written. Run it, crash it,
+        run it again: it starts from the top every time.
+
+          python3 naive.py ORDER [--fresh] [--crash-after STEP]"""
+        import json
+        import sys
+
+        from engine import connect, crash, forget, option
+        from shop import book_courier, charge_card, reserve_stock, send_message
+
+        args = sys.argv[1:]
+        order = args[0]
+        db = connect()
+        if "--fresh" in args:
+            forget(db, order)
+        stop = option(args, "--crash-after")
+        print("job", order, "starts from the top")
+        steps = (
+            ("reserve_stock", reserve_stock, (order,)),
+            ("charge_card", charge_card, (db, order, 2500)),
+            ("send_receipt", send_message, (db, order, "receipt")),
+            ("book_courier", book_courier, (order,)),
+        )
+        for name, action, values in steps:
+            print("  done   ", name, "->", json.dumps(action(*values), sort_keys=True))
+            if name == stop:
+                crash("after " + name)
+        print("job", order, "finished")
+        PY
+        cat > order.py <<'PY'
+        """The order workflow: reserve stock, charge the card, email a receipt, book a courier.
+
+          python3 order.py ORDER [--fresh] [--crash-after N] [--crash-inside STEP] [--keyed] [--v2]
+
+        --fresh forgets the order first. --crash-after N stops the process after N new steps;
+        --crash-inside STEP stops it after that step's effect but before its journal row.
+        --keyed charges the card with an idempotency key. --v2 is a changed version of this
+        code, with the receipt sent before the card is charged."""
+        import sys
+
+        from engine import NotDeterministic, Workflow, connect, forget, option
+        from shop import book_courier, charge_card, reserve_stock, send_message
+
+        args = sys.argv[1:]
+        order = args[0]
+        db = connect()
+        if "--fresh" in args:
+            forget(db, order)
+        after = option(args, "--crash-after")
+        wf = Workflow(db, order, int(after) if after else None, option(args, "--crash-inside"))
+        key = order + ":charge_card" if "--keyed" in args else None
+        try:
+            wf.step("reserve_stock", reserve_stock, order)
+            if "--v2" in args:
+                wf.step("send_receipt", send_message, db, order, "receipt")
+                wf.step("charge_card", charge_card, db, order, 2500, key)
+            else:
+                wf.step("charge_card", charge_card, db, order, 2500, key)
+                wf.step("send_receipt", send_message, db, order, "receipt")
+            wf.step("book_courier", book_courier, order)
+        except NotDeterministic as problem:
+            print("stopped, not deterministic:", problem)
+            sys.exit(1)
+        print("workflow", order, "finished")
+        PY
+        cat > retry.py <<'PY'
+        """Retries with exponential backoff, a cap and jitter, against a card provider that times
+        out on purpose. Nothing really waits, so the Run is quick: the waits are printed.
+
+          python3 retry.py [--fail N] [--attempts N] [--jitter]"""
+        import random
+        import sys
+
+        from engine import option
+
+        BASE = 0.5
+        FACTOR = 2
+        CAP = 4.0
+        TIMEOUT = 2.0
+
+        args = sys.argv[1:]
+        fail = int(option(args, "--fail") or 3)
+        attempts = int(option(args, "--attempts") or 5)
+        chance = random.Random(7)
+        waited = 0.0
+        print("provider times out", fail, "times; at most", attempts, "attempts")
+        for attempt in range(1, attempts + 1):
+            if attempt > fail:
+                print("attempt", attempt, "charged")
+                break
+            if attempt == attempts:
+                print("attempt", attempt, "timed out after", TIMEOUT, "s, no attempts left")
+                print("gave up: the step fails and the workflow decides what happens next")
+                break
+            delay = min(CAP, BASE * FACTOR ** (attempt - 1))
+            if "--jitter" in args:
+                delay = round(chance.uniform(0, delay), 2)
+            waited += delay
+            print("attempt", attempt, "timed out after", TIMEOUT, "s, wait", delay, "s")
+        print("waited", round(waited, 2), "s in all")
+        PY
+        cat > remind.py <<'PY'
+        """An invoice with a durable timer: send it, wait three days, send a reminder. The wait is
+        a journal row holding the time to wake, so nothing runs while it waits. The lab's clock is
+        a number you give, in seconds, so every Run prints the same.
+
+          python3 remind.py INVOICE --now SECONDS [--fresh]"""
+        import sys
+
+        from engine import Workflow, connect, forget, option
+        from shop import send_message
+
+        THREE_DAYS = 3 * 24 * 60 * 60
+
+        args = sys.argv[1:]
+        invoice = args[0]
+        now = int(option(args, "--now") or 0)
+        db = connect()
+        if "--fresh" in args:
+            forget(db, invoice)
+        wf = Workflow(db, invoice)
+        wf.step("send_invoice", send_message, db, invoice, "invoice")
+        left = wf.sleep("wait_three_days", THREE_DAYS, now)
+        if left > 0:
+            print("now", str(now) + ": the timer is not due,", left, "s left; nothing runs while it waits")
+            sys.exit(0)
+        wf.step("send_reminder", send_message, db, invoice, "reminder")
+        print("workflow", invoice, "finished")
+        PY
+        cat > saga.py <<'PY'
+        """A trip booked as a saga: a flight, a hotel and a car. If a step fails, the steps
+        already done are undone newest first by their compensations, each a journal step too.
+
+          python3 saga.py TRIP [--fresh] [--fail-at STEP] [--crash-after N]"""
+        import sys
+
+        from engine import Workflow, connect, forget, option
+        from shop import book, cancel
+
+        STEPS = (("book_flight", "cancel_flight", "flight"),
+                 ("book_hotel", "cancel_hotel", "hotel"),
+                 ("book_car", "cancel_car", "car"))
+
+        args = sys.argv[1:]
+        trip = args[0]
+        fail_at = option(args, "--fail-at")
+        db = connect()
+        if "--fresh" in args:
+            forget(db, trip)
+        after = option(args, "--crash-after")
+        wf = Workflow(db, trip, int(after) if after else None)
+        done = []
+        for do, undo, item in STEPS:
+            result = wf.step(do, book, db, trip, item, do == fail_at)
+            if "failed" in result:
+                print("compensating, newest first")
+                for undo_name, undo_item in reversed(done):
+                    wf.step(undo_name, cancel, db, trip, undo_item)
+                print("saga", trip, "undone: nothing is left booked")
+                sys.exit(0)
+            done.append((undo, item))
+        print("saga", trip, "finished: everything is booked")
+        PY
+        exec python3 -c "import signal; signal.sigwait([signal.SIGTERM, signal.SIGINT])"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import pg; pg.Connection().run('SELECT 1')"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+    labels:
+      lab.title: Python worker
